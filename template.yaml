@@ -28,67 +28,51 @@ Resources:
               Resource: "*"
             - Effect: Allow
               Action:
-                # Add object version actions for version-aware ops
+                # Version-aware + tagging ops
                 - s3:GetObject
                 - s3:GetObjectVersion
+                - s3:GetObjectTagging
                 - s3:PutObject
+                - s3:PutObjectTagging
                 - s3:ListBucket
                 - s3:ListBucketVersions
               Resource:
                 - arn:aws:s3:::dcli-oracle-erp-storage
                 - arn:aws:s3:::dcli-oracle-erp-storage/*
-
       Events:
         LockAPI:
           Type: Api
-          Properties:
-            Path: /lock
-            Method: post
+          Properties: { Path: /lock, Method: post }
         UnlockAPI:
           Type: Api
-          Properties:
-            Path: /unlock
-            Method: post
+          Properties: { Path: /unlock, Method: post }
         StatusAPI:
           Type: Api
-          Properties:
-            Path: /status
-            Method: get
+          Properties: { Path: /status, Method: get }
         GetUrlAPI:
           Type: Api
-          Properties:
-            Path: /get-url
-            Method: post
+          Properties: { Path: /get-url, Method: post }
         S3FilesAPI:
           Type: Api
-          Properties:
-            Path: /s3-files
-            Method: get
+          Properties: { Path: /s3-files, Method: get }
         ListAPI:
           Type: Api
-          Properties:
-            Path: /list
-            Method: get
+          Properties: { Path: /list, Method: get }
         UploadAPI:
           Type: Api
-          Properties:
-            Path: /upload
-            Method: post
+          Properties: { Path: /upload, Method: post }
         VersionsAPI:
           Type: Api
-          Properties:
-            Path: /versions
-            Method: post
+          Properties: { Path: /versions, Method: post }
         DownloadAPI:
           Type: Api
-          Properties:
-            Path: /download
-            Method: post
+          Properties: { Path: /download, Method: post }
+        TagsAPI:
+          Type: Api
+          Properties: { Path: /tags, Method: post }
         OptionsAPI:
           Type: Api
-          Properties:
-            Path: /{proxy+}
-            Method: options
+          Properties: { Path: /{proxy+}, Method: options }
 
   FileLocksTable:
     Type: AWS::DynamoDB::Table
