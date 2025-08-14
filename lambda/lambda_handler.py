@@ -3,11 +3,43 @@ import json
 import os
 import base64
 from datetime import datetime
+from urllib.parse import quote
 
 s3 = boto3.client('s3')
 ddb = boto3.resource('dynamodb')
 table = ddb.Table(os.environ['DDB_TABLE'])
 BUCKET = os.environ['S3_BUCKET']
+
+
+# --- helpers ---
+def encode_tagging(tags: dict) -> str:
+    """
+    Build an S3 Tagging string like 'comment=My%20note&key2=val2'
+    Values are RFC3986-encoded with quote(). Max 10 tags enforced.
+    """
+    items = list(tags.items())[:10]
+    pairs = []
+    for k, v in items:
+        k = str(k)[:128]   # S3 tag key limit
+        v = str(v)[:256]   # S3 tag value limit
+        pairs.append(
+            f"{quote(k, safe='-_.~')}={quote(v, safe='-_.~')}"
+        )
+    return "&".join(pairs)
+
+
+def tags_list_to_dict(tagset):
+    """Convert [{'Key': 'k', 'Value': 'v'}, ...] -> {'k': 'v', ...}"""
+    return {t['Key']: t['Value'] for t in (tagset or [])}
+
+
+def parse_bool(val):
+    if isinstance(val, bool):
+        return val
+    if not isinstance(val, str):
+        return False
+    return val.lower() in ('1', 'true', 'yes', 'y', 'on')
+
 
 def lambda_handler(event, context):
     print("Received event:", json.dumps(event))
@@ -27,19 +59,24 @@ def lambda_handler(event, context):
     elif path == '/unlock' and method == 'POST':
         return unlock_file(body)
     elif path == '/get-url' and method == 'POST':
+        # supports tagging for presigned PUT
         return generate_presigned_url(body)
     elif path == '/s3-files' and method == 'GET':
-        return list_s3_files()
+        # supports include_tags via query string (?include_tags=true)
+        return list_s3_files(event)
     elif path == '/upload' and method == 'POST':
+        # adds tagging on upload when "comment" provided
         return upload_files_to_s3(body)
     elif path == '/download' and method == 'POST':
-        # NEW: supports optional version
         return download_file_from_s3(body)
     elif path == '/versions' and method == 'POST':
-        # Lists versions for a single key
         return get_file_versions(body)
+    elif path == '/tags' and method == 'POST':
+        # fetch tags for a single object (and optional VersionId)
+        return get_object_tags(body)
     else:
         return build_response(400, {"error": f"Unsupported operation: {method} {path}"})
+
 
 def build_response(status, body=None):
     return {
@@ -53,12 +90,14 @@ def build_response(status, body=None):
         'body': json.dumps(body) if body is not None else ''
     }
 
+
 def list_files():
     try:
         resp = table.scan()
         return build_response(200, resp.get('Items', []))
     except Exception as e:
         return build_response(500, {'error': str(e)})
+
 
 def lock_file(body):
     try:
@@ -82,6 +121,7 @@ def lock_file(body):
     except Exception as e:
         return build_response(500, {'error': str(e)})
 
+
 def unlock_file(body):
     try:
         filename = body['filename']
@@ -97,52 +137,99 @@ def unlock_file(body):
     except Exception as e:
         return build_response(500, {'error': str(e)})
 
+
 def generate_presigned_url(body):
     """
     Request:
     {
       "filename": "path/to/file.txt",
       "action": "get" | "put",
-      "version_id": "<optional VersionId>"
+      "version_id": "<optional VersionId>",
+      "comment": "optional comment to store as S3 tag on PUT"
     }
+    Response for PUT includes required 'headers' to send (x-amz-tagging).
     """
     try:
         filename = body['filename']
         action = body['action']
         version_id = body.get('version_id') or body.get('versionId')
+        comment = body.get('comment')  # optional
 
         if action == 'get':
             params = {'Bucket': BUCKET, 'Key': filename}
             if version_id:
                 params['VersionId'] = version_id
-            url = s3.generate_presigned_url(
-                'get_object', Params=params, ExpiresIn=3600
-            )
+            url = s3.generate_presigned_url('get_object', Params=params, ExpiresIn=3600)
+            return build_response(200, {'url': url})
+
         elif action == 'put':
-            url = s3.generate_presigned_url(
-                'put_object',
-                Params={'Bucket': BUCKET, 'Key': filename},
-                ExpiresIn=3600
-            )
+            params = {'Bucket': BUCKET, 'Key': filename}
+            required_headers = {}
+
+            # If comment present, sign the Tagging into the URL and return the header client must send.
+            if comment:
+                tagging_str = encode_tagging({'comment': comment})
+                params['Tagging'] = tagging_str
+                required_headers['x-amz-tagging'] = tagging_str
+
+            url = s3.generate_presigned_url('put_object', Params=params, ExpiresIn=3600)
+            resp = {'url': url}
+            if required_headers:
+                resp['headers'] = required_headers
+            return build_response(200, resp)
+
         else:
             return build_response(400, {'error': "action must be 'get' or 'put'"})
 
-        return build_response(200, {'url': url})
     except KeyError as ke:
         return build_response(400, {'error': f"Missing field: {ke}"})
     except Exception as e:
         return build_response(500, {'error': str(e)})
 
-def list_s3_files():
+
+def list_s3_files(event=None):
     try:
-        # Lists current objects (latest versions only)
+        include_tags = False
+        if event and event.get('queryStringParameters'):
+            include_tags = parse_bool(event['queryStringParameters'].get('include_tags', 'false'))
+
         response = s3.list_objects_v2(Bucket=BUCKET)
-        files = [obj['Key'] for obj in response.get('Contents', [])]
+        contents = response.get('Contents', [])
+
+        if not include_tags:
+            files = [obj['Key'] for obj in contents]
+            return build_response(200, files)
+
+        files = []
+        for obj in contents:
+            key = obj['Key']
+            try:
+                tag_resp = s3.get_object_tagging(Bucket=BUCKET, Key=key)
+                tags = tags_list_to_dict(tag_resp.get('TagSet', []))
+            except Exception:
+                tags = {'_error': 'failed_to_fetch'}
+            files.append({'key': key, 'tags': tags})
+
         return build_response(200, files)
+
     except Exception as e:
         return build_response(500, {'error': str(e)})
 
+
 def upload_files_to_s3(body):
+    """
+    Request:
+    {
+      "files": [
+        {
+          "key": "path/to/file.txt",
+          "content_base64": "...",
+          "content_type": "text/plain",
+          "comment": "optional comment to store as S3 tag"
+        }
+      ]
+    }
+    """
     try:
         uploaded = []
         for file in body.get('files', []):
@@ -150,19 +237,31 @@ def upload_files_to_s3(body):
             content = base64.b64decode(file['content_base64'])
             content_type = file.get('content_type', 'application/octet-stream')
 
-            s3.put_object(
-                Bucket=BUCKET,
-                Key=key,
-                Body=content,
-                ContentType=content_type
-            )
-            uploaded.append(key)
+            put_kwargs = {
+                'Bucket': BUCKET,
+                'Key': key,
+                'Body': content,
+                'ContentType': content_type
+            }
+
+            # Add Tagging on create if comment provided
+            comment = file.get('comment')
+            if comment:
+                put_kwargs['Tagging'] = encode_tagging({'comment': comment})
+
+            result = s3.put_object(**put_kwargs)
+            uploaded.append({
+                'key': key,
+                'etag': result.get('ETag'),
+                'version_id': result.get('VersionId')
+            })
 
         return build_response(200, {'uploaded': uploaded})
     except KeyError as ke:
         return build_response(400, {'error': f"Missing field: {ke}"})
     except Exception as e:
         return build_response(500, {'error': str(e)})
+
 
 def download_file_from_s3(body):
     """
@@ -199,11 +298,11 @@ def download_file_from_s3(body):
     except Exception as e:
         return build_response(500, {'error': str(e)})
 
+
 def get_file_versions(body):
     """
     Request:
     { "filename": "path/to/file.txt" }
-
     Response includes all versions for that exact Key, newest first.
     """
     try:
@@ -223,21 +322,46 @@ def get_file_versions(body):
                         'Size': v['Size'],
                         'ETag': v.get('ETag')
                     })
-            # (Optional) include delete markers if you care
-            # for dm in page.get('DeleteMarkers', []):
-            #     if dm['Key'] == filename:
-            #         versions.append({
-            #             'VersionId': dm['VersionId'],
-            #             'IsLatest': dm['IsLatest'],
-            #             'LastModified': dm['LastModified'].isoformat(),
-            #             'DeleteMarker': True
-            #         })
 
-        # Sort newest first (just in case)
         versions.sort(key=lambda x: x['LastModified'], reverse=True)
-
         return build_response(200, {'filename': filename, 'versions': versions})
     except KeyError as ke:
         return build_response(400, {'error': f"Missing field: {ke}"})
+    except Exception as e:
+        return build_response(500, {'error': str(e)})
+
+
+def get_object_tags(body):
+    """
+    Request:
+    {
+      "filename": "path/to/file.txt",
+      "version_id": "<optional VersionId>"
+    }
+    Response:
+    {
+      "filename": "...",
+      "version_id": "<if present>",
+      "tags": { "comment": "...", ... }
+    }
+    """
+    try:
+        filename = body['filename']
+        version_id = body.get('version_id') or body.get('versionId')
+
+        params = {'Bucket': BUCKET, 'Key': filename}
+        if version_id:
+            params['VersionId'] = version_id
+
+        resp = s3.get_object_tagging(**params)
+        return build_response(200, {
+            'filename': filename,
+            'version_id': version_id,
+            'tags': tags_list_to_dict(resp.get('TagSet', []))
+        })
+    except KeyError as ke:
+        return build_response(400, {'error': f"Missing field: {ke}"})
+    except s3.exceptions.NoSuchKey:
+        return build_response(404, {'error': 'Object not found'})
     except Exception as e:
         return build_response(500, {'error': str(e)})
