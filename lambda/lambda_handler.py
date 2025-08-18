@@ -41,6 +41,25 @@ def parse_bool(val):
     return val.lower() in ('1', 'true', 'yes', 'y', 'on')
 
 
+def get_qp(event, key, default=None):
+    """Get query string parameter safely."""
+    qs = (event or {}).get('queryStringParameters') or {}
+    return qs.get(key, default)
+
+
+def build_response(status, body=None):
+    return {
+        'statusCode': status,
+        'headers': {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': '*',
+            'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+            'Content-Type': 'application/json'
+        },
+        'body': json.dumps(body) if body is not None else ''
+    }
+
+
 def lambda_handler(event, context):
     print("Received event:", json.dumps(event))
     method = event.get('httpMethod', '')
@@ -59,37 +78,26 @@ def lambda_handler(event, context):
     elif path == '/unlock' and method == 'POST':
         return unlock_file(body)
     elif path == '/get-url' and method == 'POST':
-        # supports tagging for presigned PUT
         return generate_presigned_url(body)
     elif path == '/s3-files' and method == 'GET':
-        # supports include_tags via query string (?include_tags=true)
+        # now supports include_tags, prefix, max_keys, continuation_token
         return list_s3_files(event)
+    elif path == '/search' and method == 'GET':
+        # NEW: combined prefix+keyword search, optional tag match, paginated
+        return search_s3_files(event)
     elif path == '/upload' and method == 'POST':
-        # adds tagging on upload when "comment" provided
         return upload_files_to_s3(body)
     elif path == '/download' and method == 'POST':
         return download_file_from_s3(body)
     elif path == '/versions' and method == 'POST':
         return get_file_versions(body)
     elif path == '/tags' and method == 'POST':
-        # fetch tags for a single object (and optional VersionId)
         return get_object_tags(body)
     else:
         return build_response(400, {"error": f"Unsupported operation: {method} {path}"})
 
 
-def build_response(status, body=None):
-    return {
-        'statusCode': status,
-        'headers': {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': '*',
-            'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-            'Content-Type': 'application/json'
-        },
-        'body': json.dumps(body) if body is not None else ''
-    }
-
+# --- existing handlers unchanged below, except /s3-files enhancements ---
 
 def list_files():
     try:
@@ -166,7 +174,6 @@ def generate_presigned_url(body):
             params = {'Bucket': BUCKET, 'Key': filename}
             required_headers = {}
 
-            # If comment present, sign the Tagging into the URL and return the header client must send.
             if comment:
                 tagging_str = encode_tagging({'comment': comment})
                 params['Tagging'] = tagging_str
@@ -188,17 +195,39 @@ def generate_presigned_url(body):
 
 
 def list_s3_files(event=None):
+    """
+    GET /s3-files?include_tags=true&prefix=foo/&max_keys=200&continuation_token=...
+    - Basic bucket listing with optional prefix, tags, and pagination.
+    """
     try:
-        include_tags = False
-        if event and event.get('queryStringParameters'):
-            include_tags = parse_bool(event['queryStringParameters'].get('include_tags', 'false'))
+        include_tags = parse_bool(get_qp(event, 'include_tags', 'false'))
+        prefix = get_qp(event, 'prefix', None)
+        max_keys_raw = get_qp(event, 'max_keys', None)
+        token = get_qp(event, 'continuation_token', None)
 
-        response = s3.list_objects_v2(Bucket=BUCKET)
+        list_kwargs = {'Bucket': BUCKET}
+        if prefix:
+            list_kwargs['Prefix'] = prefix
+        if token:
+            list_kwargs['ContinuationToken'] = token
+        if max_keys_raw:
+            try:
+                list_kwargs['MaxKeys'] = max(1, min(int(max_keys_raw), 1000))
+            except ValueError:
+                pass  # ignore bad input, fall back to AWS default
+
+        response = s3.list_objects_v2(**list_kwargs)
         contents = response.get('Contents', [])
+        next_token = response.get('NextContinuationToken')
 
         if not include_tags:
-            files = [obj['Key'] for obj in contents]
-            return build_response(200, files)
+            files = [{
+                'key': obj['Key'],
+                'size': obj.get('Size'),
+                'last_modified': obj.get('LastModified').isoformat() if obj.get('LastModified') else None,
+                'e_tag': obj.get('ETag')
+            } for obj in contents]
+            return build_response(200, {'items': files, 'next_token': next_token})
 
         files = []
         for obj in contents:
@@ -208,9 +237,80 @@ def list_s3_files(event=None):
                 tags = tags_list_to_dict(tag_resp.get('TagSet', []))
             except Exception:
                 tags = {'_error': 'failed_to_fetch'}
-            files.append({'key': key, 'tags': tags})
+            files.append({
+                'key': key,
+                'size': obj.get('Size'),
+                'last_modified': obj.get('LastModified').isoformat() if obj.get('LastModified') else None,
+                'e_tag': obj.get('ETag'),
+                'tags': tags
+            })
 
-        return build_response(200, files)
+        return build_response(200, {'items': files, 'next_token': next_token})
+
+    except Exception as e:
+        return build_response(500, {'error': str(e)})
+
+
+def search_s3_files(event):
+    """
+    GET /search?q=invoice&prefix=2025/&include_tags=true&max_keys=500&continuation_token=...
+    - Uses Prefix on the server to narrow the list, then filters results by substring 'q'
+      against key and (optionally) tags.
+    - Case-insensitive keyword search.
+    """
+    try:
+        q = (get_qp(event, 'q', '') or '').strip()
+        q_lower = q.lower()
+        include_tags = parse_bool(get_qp(event, 'include_tags', 'false'))
+        prefix = get_qp(event, 'prefix', None)
+        max_keys_raw = get_qp(event, 'max_keys', None)
+        token = get_qp(event, 'continuation_token', None)
+
+        list_kwargs = {'Bucket': BUCKET}
+        if prefix:
+            list_kwargs['Prefix'] = prefix
+        if token:
+            list_kwargs['ContinuationToken'] = token
+        if max_keys_raw:
+            try:
+                list_kwargs['MaxKeys'] = max(1, min(int(max_keys_raw), 1000))
+            except ValueError:
+                pass
+
+        response = s3.list_objects_v2(**list_kwargs)
+        contents = response.get('Contents', [])
+        next_token = response.get('NextContinuationToken')
+
+        results = []
+        for obj in contents:
+            key = obj['Key']
+            key_hit = (not q) or (q_lower in key.lower())
+
+            tags = None
+            tag_hit = False
+            if include_tags:
+                try:
+                    tag_resp = s3.get_object_tagging(Bucket=BUCKET, Key=key)
+                    tags = tags_list_to_dict(tag_resp.get('TagSet', []))
+                    if q:
+                        # check both tag keys and values
+                        for tk, tv in tags.items():
+                            if q_lower in str(tk).lower() or q_lower in str(tv).lower():
+                                tag_hit = True
+                                break
+                except Exception:
+                    tags = {'_error': 'failed_to_fetch'}
+
+            if key_hit or tag_hit:
+                results.append({
+                    'key': key,
+                    'size': obj.get('Size'),
+                    'last_modified': obj.get('LastModified').isoformat() if obj.get('LastModified') else None,
+                    'e_tag': obj.get('ETag'),
+                    **({'tags': tags} if include_tags else {})
+                })
+
+        return build_response(200, {'items': results, 'next_token': next_token})
 
     except Exception as e:
         return build_response(500, {'error': str(e)})
@@ -244,7 +344,6 @@ def upload_files_to_s3(body):
                 'ContentType': content_type
             }
 
-            # Add Tagging on create if comment provided
             comment = file.get('comment')
             if comment:
                 put_kwargs['Tagging'] = encode_tagging({'comment': comment})
