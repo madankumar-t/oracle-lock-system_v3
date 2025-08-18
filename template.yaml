@@ -28,7 +28,6 @@ Resources:
               Resource: "*"
             - Effect: Allow
               Action:
-                # Version-aware + tagging ops
                 - s3:GetObject
                 - s3:GetObjectVersion
                 - s3:GetObjectTagging
@@ -65,6 +64,11 @@ Resources:
           Properties:
             Path: /s3-files
             Method: get
+        SearchAPI:            # <-- NEW
+          Type: Api
+          Properties:
+            Path: /search
+            Method: get
         ListAPI:
           Type: Api
           Properties:
@@ -93,7 +97,7 @@ Resources:
         OptionsAPI:
           Type: Api
           Properties:
-            Path: "/{proxy+}"   # MUST be quoted
+            Path: "/{proxy+}"
             Method: options
 
   FileLocksTable:
