@@ -4,7 +4,7 @@ Description: Oracle File Lock Management Lambda
 
 Globals:
   Function:
-    Timeout: 10
+    Timeout: 20                      # Optional: increased from 10s
     Runtime: python3.11
     Environment:
       Variables:
@@ -58,13 +58,13 @@ Resources:
           Type: Api
           Properties:
             Path: /get-url
-            Method: post
+            Method: post          # Used for presigned URL generation
         S3FilesAPI:
           Type: Api
           Properties:
             Path: /s3-files
             Method: get
-        SearchAPI:            # <-- NEW
+        SearchAPI:
           Type: Api
           Properties:
             Path: /search
@@ -100,6 +100,7 @@ Resources:
             Path: "/{proxy+}"
             Method: options
 
+  # DynamoDB table for lock state tracking
   FileLocksTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -111,6 +112,16 @@ Resources:
         - AttributeName: filename
           KeyType: HASH
       BillingMode: PAY_PER_REQUEST
+
+  #  Optional: Enable global CORS for API Gateway
+  ApiGatewayCORS:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
 
 Outputs:
   ApiEndpoint:
